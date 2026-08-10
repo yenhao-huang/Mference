@@ -24,6 +24,24 @@ constant bool FC_SHARED_INT8_ACT_SILU [[function_constant(74)]];
 constant constexpr float kInt8GeluSqrt2OverPi = 0.7978845608028654f;
 constant constexpr float kInt8GeluCubicCoeff  = 0.044715f;
 
+kernel void embed_lookup_int8(
+    device const uint8_t* table  [[buffer(0)]],
+    device const bfloat* scales  [[buffer(1)]],
+    device const bfloat* biases  [[buffer(2)]],
+    device half* out             [[buffer(3)]],
+    constant uint& token_id      [[buffer(4)]],
+    constant uint& D             [[buffer(5)]],
+    constant float& out_scale    [[buffer(6)]],
+    uint i                       [[thread_position_in_grid]]) {
+    if (i >= D) return;
+    const uint groups = D / kInt8GroupSize;
+    const uint row = token_id * D;
+    const uint aux = token_id * groups + i / kInt8GroupSize;
+    const float value = float(uint(table[row + i])) * float(scales[aux])
+                      + float(biases[aux]);
+    out[i] = half(value * out_scale);
+}
+
 static inline uint int8_fc_m(constant uint& M) {
     return (is_function_constant_defined(FC_INT8_USE_FC) &&
             FC_INT8_USE_FC &&

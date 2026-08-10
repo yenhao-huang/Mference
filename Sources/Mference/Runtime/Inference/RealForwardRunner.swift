@@ -177,9 +177,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private let cfg: ArchConfig
 
     // Kernels
-    private let embedInt4: EmbedLookupInt4
+    private let embedInt4: AffineEmbedLookup
     private let rms: RMSNorm
-    private let int4: DequantInt4GEMV
+    private let int4: AffineGEMV
+    private let headGEMV: AffineGEMV
+    private let sharedGEMV: AffineGEMV
     private let attention: Attention
     private let shared: SharedExpertRuntime
     private let moe: MoE
@@ -441,6 +443,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         self.routerEvent = context.device.makeSharedEvent()
         self.maxContext = maxContext
         self.useFusedGreedyHead = runtimeConfiguration.headPath == .fusedRows
+            && model.embeddingWeightBits == 4
         self.prefillAttentionPath = runtimeConfiguration.prefillAttentionPath
         let useFP16Ring = runtimeConfiguration.fp16RingEnabled
         self.rdadvisePolicyMode = runtimeConfiguration.rdadvisePolicy
@@ -462,11 +465,29 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                      maxPrefillChunkTokens: runtimeConfiguration.prefillConfig.chunkTokens)
 
         let silu = cfg.hiddenActivation == "silu"
-        self.embedInt4 = try EmbedLookupInt4(context: context)
-        self.rms       = try RMSNorm(context: context)
-        self.int4      = try DequantInt4GEMV(
+        self.embedInt4 = try AffineEmbedLookup(
             context: context,
+            weightBits: model.embeddingWeightBits,
+            groupSize: model.embeddingGroupSize)
+        self.rms       = try RMSNorm(context: context)
+        self.int4      = try AffineGEMV(
+            context: context,
+            weightBits: model.attentionWeightBits,
+            groupSize: model.attentionGroupSize,
             additionalShapes: cfg.decodeInt4GEMVShapes)
+        self.headGEMV = try AffineGEMV(
+            context: context,
+            weightBits: model.embeddingWeightBits,
+            groupSize: model.embeddingGroupSize,
+            additionalShapes: [(m: cfg.vocabSize, n: cfg.hiddenSize)])
+        self.sharedGEMV = try AffineGEMV(
+            context: context,
+            weightBits: model.sharedExpertWeightBits,
+            groupSize: model.sharedExpertGroupSize,
+            additionalShapes: [
+                (m: cfg.intermediateSize, n: cfg.hiddenSize),
+                (m: cfg.hiddenSize, n: cfg.intermediateSize),
+            ])
         self.attention = try Attention(context: context)
         self.shared    = try SharedExpertRuntime(context: context,
                                                   weightBits: model.sharedExpertWeightBits,
@@ -1077,6 +1098,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let ptr = base.assumingMemoryBound(to: Int64.self)
             return (0..<cfg.topKExperts).map { min(max(0, Int(ptr[row + $0])), cap) }
         }
+        if table.dtype == 5 {
+            let ptr = base.assumingMemoryBound(to: Int32.self)
+            return (0..<cfg.topKExperts).map { min(max(0, Int(ptr[row + $0])), cap) }
+        }
         let ptr = base.assumingMemoryBound(to: UInt32.self)
         return (0..<cfg.topKExperts).map { min(Int(ptr[row + $0]), cap) }
     }
@@ -1331,7 +1356,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     let bindings = DSV4PrefillBindings(
                         model: model, ctx: ctx, cfg: cfg,
                         dsv4: dsv4, moeDSV4: moeDSV4, state: dsv4State,
-                        int4: int4, rms: rms, embed: embedInt4,
+                        int4: int4, headGEMV: headGEMV, sharedGEMV: sharedGEMV,
+                        rms: rms, embed: embedInt4,
                         fusionHead: fusionHead,
                         sharedExperts: sharedExpertProjections.map {
                             DSV4PrefillSharedExpert(gate: $0.gate, up: $0.up, down: $0.down)
@@ -3582,7 +3608,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                          weight: fNorm.buffer,
                                          weightOffset: Int(fNorm.offset),
                                          out: self.normed, d: D, eps: eps)
-                    self.int4.encode(commandBuffer: cb,
+                    self.headGEMV.encode(commandBuffer: cb,
                                      weights: lm.buffer, weightsOffset: Int(lm.offset),
                                      scales:  lm.buffer, scalesOffset:  Int(lm.scaleOffset),
                                      biases:  lm.buffer, biasesOffset:  Int(lm.biasOffset),
@@ -3620,7 +3646,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                          weight: fNorm.buffer,
                                          weightOffset: Int(fNorm.offset),
                                          out: self.normed, d: D, eps: eps)
-                    self.int4.encode(commandBuffer: cb,
+                    self.headGEMV.encode(commandBuffer: cb,
                                      weights: lm.buffer, weightsOffset: Int(lm.offset),
                                      scales:  lm.buffer, scalesOffset:  Int(lm.scaleOffset),
                                      biases:  lm.buffer, biasesOffset:  Int(lm.biasOffset),
@@ -4667,7 +4693,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             // head group (the output row index selects both the weight block
             // and the activation slice), then the mixing projection.
             dsv4.encodeOGroupProjection(
-                commandBuffer: cb,
+                commandBuffer: cb, affine: int4,
                 weights: oaView.buffer, weightsOffset: Int(oaView.offset),
                 scales: oaView.buffer, scalesOffset: Int(oaView.scaleOffset),
                 biases: oaView.buffer, biasesOffset: Int(oaView.biasOffset),
@@ -4715,6 +4741,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 let expertCap = UInt32(cfg.numExperts - 1)
                 if table.dtype == 4 {
                     let tPtr = base.assumingMemoryBound(to: Int64.self)
+                    for i in 0..<cfg.topKExperts {
+                        idxPtr[i] = min(UInt32(clamping: max(0, tPtr[row + i])), expertCap)
+                    }
+                } else if table.dtype == 5 {
+                    let tPtr = base.assumingMemoryBound(to: Int32.self)
                     for i in 0..<cfg.topKExperts {
                         idxPtr[i] = min(UInt32(clamping: max(0, tPtr[row + i])), expertCap)
                     }
@@ -4775,7 +4806,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             // on the routed experts, so the GPU runs it while the CPU wakes,
             // plans slots and preads the routed-expert blobs.
             let routerSignal = encodeRouterSignal(cb)
-            int4.encode(commandBuffer: cb,
+            sharedGEMV.encode(commandBuffer: cb,
                         weights: sharedProj.gate.weights,
                         weightsOffset: sharedProj.gate.weightsOffset,
                         scales: sharedProj.gate.scales,
@@ -4784,7 +4815,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         biasesOffset: sharedProj.gate.biasesOffset,
                         x: routedX, y: denseScratchGate,
                         m: FShared, n: D)
-            int4.encode(commandBuffer: cb,
+            sharedGEMV.encode(commandBuffer: cb,
                         weights: sharedProj.up.weights,
                         weightsOffset: sharedProj.up.weightsOffset,
                         scales: sharedProj.up.scales,
@@ -4799,7 +4830,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                       out: denseScratchAct,
                                       n: cfg.intermediateSize,
                                       limit: Float(cfg.swigluLimit))
-            int4.encode(commandBuffer: cb,
+            sharedGEMV.encode(commandBuffer: cb,
                         weights: sharedProj.down.weights,
                         weightsOffset: sharedProj.down.weightsOffset,
                         scales: sharedProj.down.scales,
@@ -4862,6 +4893,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
 
             let routedOffsets = model.routedExpertOffsets(layer: L)
             let gateGroupSize = UInt32(model.routedGateGroupSize(layer: L))
+            let expertGroupSize = UInt32(model.routedExpertGroupSize)
             guard let plannedFetch = try model.planRoutedExperts(layer: L, experts: experts)
             else {
                 throw ModelError.routedExpertPlanUnavailable(layer: L)
@@ -4893,7 +4925,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     activeSlotIndices: phase1HitSlots,
                     activeCount: UInt32(phase1HitSlots.count),
                     d: D, f: FmoE,
-                    gateGroupSize: gateGroupSize)
+                    gateGroupSize: gateGroupSize,
+                    expertGroupSize: expertGroupSize)
                 phase1HitCB = hitCB
             }
 
@@ -4948,7 +4981,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     activeSlotIndices: phase1MissSlots,
                     activeCount: UInt32(phase1MissSlots.count),
                     d: D, f: FmoE,
-                    gateGroupSize: gateGroupSize)
+                    gateGroupSize: gateGroupSize,
+                    expertGroupSize: expertGroupSize)
             } else {
                 moeDSV4.encodeRoutedPhase1(
                     commandBuffer: routedCB,
@@ -4957,7 +4991,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     routedOffsets: routedOffsets,
                     x: routedX, acts: moeActs,
                     d: D, f: FmoE,
-                    gateGroupSize: gateGroupSize)
+                    gateGroupSize: gateGroupSize,
+                    expertGroupSize: expertGroupSize)
             }
             // Phase-2 seeds with the shared-expert output, so h2Buf holds
             // routed + shared — exactly the reference's `routed +
@@ -4971,7 +5006,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 routingWeights: outWeights,
                 residual: h1Buf,
                 y: h2Buf,
-                d: D, f: FmoE)
+                d: D, f: FmoE,
+                expertGroupSize: expertGroupSize)
             // FFN-site placement + residual mix: streamsAlt -> streams.
             dsv4.encodeHCPlaceMix(commandBuffer: routedCB, streams: streamsAlt,
                                   sub: h2Buf, post: hcPostF, comb: hcCombF,
@@ -5033,12 +5069,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                          weight: fNorm.buffer,
                                          weightOffset: Int(fNorm.offset),
                                          out: self.normed, d: D, eps: eps)
-                    self.int4.encode(commandBuffer: cb,
-                                     weights: lm.buffer, weightsOffset: Int(lm.offset),
-                                     scales: lm.buffer, scalesOffset: Int(lm.scaleOffset),
-                                     biases: lm.buffer, biasesOffset: Int(lm.biasOffset),
-                                     x: self.normed, y: logits,
-                                     m: UInt32(self.cfg.vocabSize), n: D)
+                    self.headGEMV.encode(commandBuffer: cb,
+                                         weights: lm.buffer, weightsOffset: Int(lm.offset),
+                                         scales: lm.buffer, scalesOffset: Int(lm.scaleOffset),
+                                         biases: lm.buffer, biasesOffset: Int(lm.biasOffset),
+                                         x: self.normed, y: logits,
+                                         m: UInt32(self.cfg.vocabSize), n: D)
                 }
                 totalHeadNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tHead
             }

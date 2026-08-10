@@ -770,10 +770,9 @@ kernel void router_hash_weights_k6_par(
     }
 }
 
-// Each SIMD computes one affine INT2 row: 16 elements per u32, group-64
-// scales/biases (16 bytes of packed weights per group). Blocks of 4 groups
-// load 2 bytes per lane (8 elements); packed sub-tensor offsets are 2-byte
-// aligned, so ushort loads are safe.
+// Each SIMD computes one affine INT2 row. Packed weights are independent of
+// group size; OptiQ uses group 128 while the original DQ checkpoint uses 64
+// (and group 32 for some gate projections).
 static inline float moe_int2_gemv_row_simd_dev_vec(
     device const uint8_t* W,
     device const bfloat* S,
@@ -781,61 +780,39 @@ static inline float moe_int2_gemv_row_simd_dev_vec(
     device const half* x,
     uint row,
     uint N,
+    uint group_size,
     uint lane
 ) {
-    const uint n_groups = N / kMoEGroupSize;
+    const uint n_groups = N / group_size;
     const uint row_bytes = N / 4;
     device const uint8_t* W_row = W + uint(row) * row_bytes;
     device const bfloat* s_row = S + uint(row) * n_groups;
     device const bfloat* b_row = B + uint(row) * n_groups;
 
     float acc = 0.0f;
-    const uint full_blocks = n_groups / 4;
-    for (uint blk = 0; blk < full_blocks; ++blk) {
-        const uint byte_base = blk * 64u + lane * 2u;
-        const uint w2 = uint(*((device const ushort*)(W_row + byte_base)));
-        const uint g = blk * 4u + (lane >> 3);
+    const uint values_per_lane = group_size / 32u;
+    for (uint g = 0; g < n_groups; ++g) {
         const float s = float(s_row[g]);
         const float b = float(b_row[g]);
-        const uint elem = byte_base * 4u;
-        const half4 xa = *((device const half4*)(x + elem));
-        const half4 xb = *((device const half4*)(x + elem + 4u));
-        const float e0 = float(xa.x), e1 = float(xa.y);
-        const float e2 = float(xa.z), e3 = float(xa.w);
-        const float e4 = float(xb.x), e5 = float(xb.y);
-        const float e6 = float(xb.z), e7 = float(xb.w);
         float dot = 0.0f;
-        dot = fma(float(w2 & 0x3u), e0, dot);
-        dot = fma(float((w2 >> 2) & 0x3u), e1, dot);
-        dot = fma(float((w2 >> 4) & 0x3u), e2, dot);
-        dot = fma(float((w2 >> 6) & 0x3u), e3, dot);
-        dot = fma(float((w2 >> 8) & 0x3u), e4, dot);
-        dot = fma(float((w2 >> 10) & 0x3u), e5, dot);
-        dot = fma(float((w2 >> 12) & 0x3u), e6, dot);
-        dot = fma(float((w2 >> 14) & 0x3u), e7, dot);
-        const float sum = e0 + e1 + e2 + e3 + e4 + e5 + e6 + e7;
+        float sum = 0.0f;
+        const uint base = g * group_size + lane * values_per_lane;
+        for (uint j = 0; j < values_per_lane; ++j) {
+            const uint index = base + j;
+            const uint8_t byte = W_row[index >> 2];
+            const uint q = (uint(byte) >> ((index & 3u) * 2u)) & 0x3u;
+            const float xv = float(x[index]);
+            dot = fma(float(q), xv, dot);
+            sum += xv;
+        }
         acc = fma(s, dot, acc);
         acc = fma(b, sum, acc);
-    }
-    for (uint g = full_blocks * 4u; g < n_groups; ++g) {
-        const float s = float(s_row[g]);
-        const float b = float(b_row[g]);
-        // Two elements per lane: byte k holds elements 4k..4k+3, element j at
-        // bit 2*(j%4).
-        const uint8_t byte = W_row[g * (kMoEGroupSize / 4) + (lane >> 1)];
-        const uint shift = (lane & 1u) * 4u;
-        const float x0 = float(x[g * kMoEGroupSize + lane * 2u]);
-        const float x1 = float(x[g * kMoEGroupSize + lane * 2u + 1u]);
-        float dot = fma(float(uint((byte >> shift) & 0x3u)), x0, 0.0f);
-        dot = fma(float(uint((byte >> (shift + 2u)) & 0x3u)), x1, dot);
-        acc = fma(s, dot, acc);
-        acc = fma(b, x0 + x1, acc);
     }
     return simd_sum(acc);
 }
 
-// `gate_group_size` may be 32 or 64 (DeepSeek V4 ships most layers'
-// gate_proj at group 32); the up projection always uses kMoEGroupSize.
+// Gate and expert group sizes are independent. The original DQ checkpoint
+// uses 32/64 while OptiQ uses 128 for every routed projection.
 // The packed 2-bit weight layout is group-size independent — only the
 // scale/bias row stride and per-element group index change.
 static inline float2 moe_int2_gate_up_rows_simd_dev_vec(
@@ -849,8 +826,15 @@ static inline float2 moe_int2_gate_up_rows_simd_dev_vec(
     uint row,
     uint N,
     uint gate_group_size,
+    uint expert_group_size,
     uint lane
 ) {
+    return float2(
+        moe_int2_gemv_row_simd_dev_vec(
+            gateW, gateS, gateB, x, row, N, gate_group_size, lane),
+        moe_int2_gemv_row_simd_dev_vec(
+            upW, upS, upB, x, row, N, expert_group_size, lane));
+#if 0
     const uint n_groups = N / kMoEGroupSize;
     const uint gate_n_groups = N / gate_group_size;
     const uint row_bytes = N / 4;
@@ -934,6 +918,7 @@ static inline float2 moe_int2_gate_up_rows_simd_dev_vec(
         u_acc = fma(ub, sum, u_acc);
     }
     return float2(simd_sum(g_acc), simd_sum(u_acc));
+#endif
 }
 
 static inline void moe_phase1_int2_body(
@@ -945,6 +930,7 @@ static inline void moe_phase1_int2_body(
     uint F,
     uint top_k,
     uint gate_group_size,
+    uint expert_group_size,
     uint rows_per_tg,
     uint tg_idx,
     uint sg_idx,
@@ -964,7 +950,7 @@ static inline void moe_phase1_int2_body(
         base + re.up_W_off,
         (device const bfloat*)(base + re.up_s_off),
         (device const bfloat*)(base + re.up_b_off),
-        x, f, D, gate_group_size, lane);
+        x, f, D, gate_group_size, expert_group_size, lane);
     if (lane == 0) {
         const float2 cgu = moe_swiglu_clamp(gu.x, gu.y);
         acts[slot * F + f] = half(moe_hidden_activation(cgu.x) * cgu.y);
@@ -980,6 +966,7 @@ kernel void moe_phase1_gate_up_act_int2(
     constant uint& F [[buffer(5)]],
     constant uint& top_k [[buffer(6)]],
     constant uint& gate_group_size [[buffer(7)]],
+    constant uint& expert_group_size [[buffer(8)]],
     uint tg_idx [[threadgroup_position_in_grid]],
     uint sg_idx [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
@@ -987,7 +974,8 @@ kernel void moe_phase1_gate_up_act_int2(
     constexpr uint rows_per_tg = 8;
     moe_phase1_int2_body(
         routed, routed_offsets, x, acts, moe_fc_d(D), moe_fc_f(F),
-        moe_fc_top_k(top_k), gate_group_size, rows_per_tg, tg_idx, sg_idx, lane);
+        moe_fc_top_k(top_k), gate_group_size, expert_group_size,
+        rows_per_tg, tg_idx, sg_idx, lane);
 }
 
 kernel void moe_phase1_gate_up_act_subset_int2(
@@ -1001,6 +989,7 @@ kernel void moe_phase1_gate_up_act_subset_int2(
     device const uint* active_slots [[buffer(7)]],
     constant uint& active_count [[buffer(8)]],
     constant uint& gate_group_size [[buffer(9)]],
+    constant uint& expert_group_size [[buffer(10)]],
     uint tg_idx [[threadgroup_position_in_grid]],
     uint sg_idx [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
@@ -1023,7 +1012,7 @@ kernel void moe_phase1_gate_up_act_subset_int2(
         base + re.up_W_off,
         (device const bfloat*)(base + re.up_s_off),
         (device const bfloat*)(base + re.up_b_off),
-        x, f, moe_fc_d(D), gate_group_size, lane);
+        x, f, moe_fc_d(D), gate_group_size, expert_group_size, lane);
     if (lane == 0) {
         const float2 cgu = moe_swiglu_clamp(gu.x, gu.y);
         acts[slot * F_ + f] = half(moe_hidden_activation(cgu.x) * cgu.y);
@@ -1039,6 +1028,7 @@ kernel void moe_phase2_down_reduce_int2_k6(
     device half* y [[buffer(5)]],
     constant uint& D [[buffer(6)]],
     constant uint& F [[buffer(7)]],
+    constant uint& expert_group_size [[buffer(8)]],
     uint d [[threadgroup_position_in_grid]],
     uint sg_idx [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
@@ -1057,7 +1047,7 @@ kernel void moe_phase2_down_reduce_int2_k6(
     device const half* act_slot = acts + sg_idx * FF;
 
     const float value = moe_int2_gemv_row_simd_dev_vec(
-        dW, dS, dB, act_slot, d, FF, lane);
+        dW, dS, dB, act_slot, d, FF, expert_group_size, lane);
     if (lane == 0) partial[sg_idx] = float(routing_w[sg_idx]) * value;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1182,9 +1172,10 @@ kernel void dsv4_prefill_moe_phase1_pairs_int2(
     constant uint& F [[buffer(5)]],
     constant uint& top_k [[buffer(6)]],
     constant uint& gate_group_size [[buffer(7)]],
-    device const DSV4PrefillRoute* routes [[buffer(8)]],
-    constant uint& route_start [[buffer(9)]],
-    constant uint& route_count [[buffer(10)]],
+    constant uint& expert_group_size [[buffer(8)]],
+    device const DSV4PrefillRoute* routes [[buffer(9)]],
+    constant uint& route_start [[buffer(10)]],
+    constant uint& route_count [[buffer(11)]],
     uint tg_idx [[threadgroup_position_in_grid]],
     uint sg_idx [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
@@ -1209,7 +1200,7 @@ kernel void dsv4_prefill_moe_phase1_pairs_int2(
         base + re.up_W_off,
         (device const bfloat*)(base + re.up_s_off),
         (device const bfloat*)(base + re.up_b_off),
-        x + uint(r.token) * DD, f, DD, gate_group_size, lane);
+        x + uint(r.token) * DD, f, DD, gate_group_size, expert_group_size, lane);
     if (lane == 0) {
         const float2 cgu = moe_swiglu_clamp(gu.x, gu.y);
         acts[(uint(r.token) * KK + uint(r.rank)) * FF + f] =
@@ -1228,9 +1219,10 @@ kernel void dsv4_prefill_moe_down_pairs_int2(
     constant uint& D [[buffer(5)]],
     constant uint& F [[buffer(6)]],
     constant uint& top_k [[buffer(7)]],
-    device const DSV4PrefillRoute* routes [[buffer(8)]],
-    constant uint& route_start [[buffer(9)]],
-    constant uint& route_count [[buffer(10)]],
+    constant uint& expert_group_size [[buffer(8)]],
+    device const DSV4PrefillRoute* routes [[buffer(9)]],
+    constant uint& route_start [[buffer(10)]],
+    constant uint& route_count [[buffer(11)]],
     uint tg_idx [[threadgroup_position_in_grid]],
     uint sg_idx [[simdgroup_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]]
@@ -1253,7 +1245,7 @@ kernel void dsv4_prefill_moe_down_pairs_int2(
         base + re.down_W_off,
         (device const bfloat*)(base + re.down_s_off),
         (device const bfloat*)(base + re.down_b_off),
-        acts + pair * FF, d, FF, lane);
+        acts + pair * FF, d, FF, expert_group_size, lane);
     if (lane == 0) {
         partials[pair * DD + d] = float(routing_w[pair]) * value;
     }

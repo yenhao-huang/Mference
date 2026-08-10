@@ -106,4 +106,44 @@ import MferenceValidationSupport
         let rel = RelError.compute(actual: actual, reference: ref)
         #expect(rel < Tolerance.quantInt4, "rel=\(rel)")
     }
+
+    @Test func embedLookupInt8_matchesScalarReference() throws {
+        let vocab = 5
+        let d = 128
+        let groups = d / 64
+        var rng = SeedTree(0x8_0731).key("embed-lookup-int8")
+        let packed = (0..<(vocab * d)).map { _ in UInt8(truncatingIfNeeded: rng.next()) }
+        let scales = (0..<(vocab * groups)).map { _ in
+            Quantization.bf16Bits(rng.uniform(0.002, 0.01))
+        }
+        let biases = (0..<(vocab * groups)).map { _ in
+            Quantization.bf16Bits(rng.uniform(-0.2, 0.0))
+        }
+        let token = 3
+        let outScale: Float = 0.75
+        let reference = (0..<d).map { i -> Float in
+            let aux = token * groups + i / 64
+            return (Float(packed[token * d + i])
+                    * Quantization.bf16ToFloat(scales[aux])
+                    + Quantization.bf16ToFloat(biases[aux])) * outScale
+        }
+        let ctx = try MetalContext()
+        let kernel = try EmbedLookupInt8(context: ctx)
+        let w = try #require(ctx.device.makeBuffer(
+            bytes: packed, length: packed.count, options: .storageModeShared))
+        let s = try #require(ctx.device.makeBuffer(
+            bytes: scales, length: scales.count * 2, options: .storageModeShared))
+        let b = try #require(ctx.device.makeBuffer(
+            bytes: biases, length: biases.count * 2, options: .storageModeShared))
+        let y = try #require(Fp16Buffer.make(ctx.device, count: d))
+        let cb = try #require(ctx.queue.makeCommandBuffer())
+        kernel.encode(commandBuffer: cb, table: w, scales: s, biases: b,
+                      out: y, tokenId: UInt32(token), d: UInt32(d),
+                      outScale: outScale)
+        cb.commit(); cb.waitUntilCompleted()
+        #expect(cb.error == nil)
+        let actual = Fp16Buffer.read(y, count: d)
+        let rel = RelError.compute(actual: actual, reference: reference)
+        #expect(rel < Tolerance.quantInt8, "INT8 embed rel=\(rel)")
+    }
 }

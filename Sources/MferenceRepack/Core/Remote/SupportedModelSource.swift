@@ -102,6 +102,21 @@ public struct SupportedModelSource: Sendable, Equatable {
         installedBytes: 97_500_000_000,
         reserveBytes: 2_147_483_648)
 
+    /// DeepSeek-V4-Flash-0731 main decoder weights. The checkpoint also
+    /// carries speculative MTP heads; Mference intentionally excludes those
+    /// auxiliary tensors and imports the 43-layer autoregressive decoder.
+    public static let deepseekV4Flash0731OptiQ = SupportedModelSource(
+        name: "deepseekv4flash0731optiq",
+        displayName: "DeepSeek-V4-Flash-0731 304B OptiQ 2-bit",
+        repoID: "mlx-community/DeepSeek-V4-Flash-0731-OptiQ-2bit",
+        revision: "0edd7d3e70d562a0fc1d1574943ca4fe2b2c1e36",
+        sourceIndexSHA256:
+            "02bb76b0f49370b0b4b469462f5069335f0b5c06a759e2088f87e03ce5a61331",
+        modelID: "deepseek-v4-flash-0731-optiq-2bit",
+        approximateDownloadBytes: 92_479_039_600,
+        installedBytes: 93_000_000_000,
+        reserveBytes: 2_147_483_648)
+
     /// Revision and index digest verified against the published repo. The
     /// download estimate is the repo's own total (148.4 GB); the vision and
     /// audio towers are excluded by the planner but they are only 18 tensors,
@@ -123,7 +138,7 @@ public struct SupportedModelSource: Sendable, Equatable {
     public static let `default` = gemma4
 
     public static let all: [SupportedModelSource] = [
-        gemma4, qwen36, deepseekV4Flash, inklingSmall,
+        gemma4, qwen36, deepseekV4Flash, deepseekV4Flash0731OptiQ, inklingSmall,
     ]
 
     public static func named(_ name: String) -> SupportedModelSource? {

@@ -202,14 +202,33 @@ final class DSV4Kernels {
     /// contiguous INT4 weight blocks of `rank` rows each, group `g` reading
     /// `x` at `g * groupIn`. Replaces one GEMV per group.
     func encodeOGroupProjection(commandBuffer: MTLCommandBuffer,
+                                affine: AffineGEMV,
                                 weights: MTLBuffer, weightsOffset: Int,
                                 scales: MTLBuffer, scalesOffset: Int,
                                 biases: MTLBuffer, biasesOffset: Int,
                                 x: MTLBuffer, xOffset: Int = 0,
                                 y: MTLBuffer, yOffset: Int = 0,
                                 rank: Int, groupIn: Int, groups: Int) {
-        precondition(groupIn % Quantization.groupSize == 0,
-                     "groupIn must be a multiple of \(Quantization.groupSize)")
+        precondition(groupIn.isMultiple(of: affine.groupSize),
+                     "groupIn must be a multiple of \(affine.groupSize)")
+        if affine.weightBits != 4 {
+            let weightBytes = rank * groupIn * affine.weightBits / 8
+            let auxBytes = rank * (groupIn / affine.groupSize)
+                * MemoryLayout<UInt16>.stride
+            let xBytes = groupIn * MemoryLayout<Float16>.stride
+            let yBytes = rank * MemoryLayout<Float16>.stride
+            for group in 0..<groups {
+                affine.encode(
+                    commandBuffer: commandBuffer,
+                    weights: weights, weightsOffset: weightsOffset + group * weightBytes,
+                    scales: scales, scalesOffset: scalesOffset + group * auxBytes,
+                    biases: biases, biasesOffset: biasesOffset + group * auxBytes,
+                    x: x, xOffset: xOffset + group * xBytes,
+                    y: y, yOffset: yOffset + group * yBytes,
+                    m: UInt32(rank), n: UInt32(groupIn))
+            }
+            return
+        }
         precondition(weightsOffset % 2 == 0,
                      "dsv4_o_group_gemv_int4 needs a 2-aligned weightsOffset, got \(weightsOffset)")
         guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }

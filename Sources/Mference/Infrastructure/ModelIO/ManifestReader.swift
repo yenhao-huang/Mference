@@ -232,8 +232,8 @@ public enum ManifestReader {
         // dynamic-quant checkpoint ships Q2 experts under a Q4 core, and the
         // MoE runtime dispatches on `quant.routedExpert.weightBits`.
         let slots: [(String, ManifestQuantSlot, Set<Int>)] = [
-            ("embedding", quant.embedding, [4]),
-            ("attention", quant.attention, [4]),
+            ("embedding", quant.embedding, [4, 8]),
+            ("attention", quant.attention, [4, 6]),
             ("router", quant.router, [8]),
             ("sharedExpert", quant.sharedExpert, [4, 8]),
             ("routedExpert", quant.routedExpert, [2, 4]),
@@ -243,7 +243,7 @@ public enum ManifestReader {
                   slot.scheme.lowercased() == "affine",
                   slot.scaleType.lowercased() == "bf16",
                   slot.biasType.lowercased() == "bf16",
-                  slot.groupSize == Quantization.groupSize else {
+                  [64, 128].contains(slot.groupSize) else {
                 throw ModelError.indexCorrupt(detail: "unsupported quantization for \(name)")
             }
         }

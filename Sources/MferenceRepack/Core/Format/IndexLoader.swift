@@ -60,13 +60,14 @@ enum IndexLoader {
                 guard let entry = v as? [String: Any] else { continue }
                 let bits = (entry["bits"] as? Int) ?? baseBits
                 let g    = (entry["group_size"] as? Int) ?? baseGroup
-                // Resident-tensor kernels assume the base group size; only
-                // 2-bit streamed routed experts support a deviating group
-                // (DeepSeek V4 ships gate_proj at group 32).
-                guard g == baseGroup || (bits == 2 && (g == 32 || g == 64)) else {
+                // The importer validates source quantization independently
+                // from the runtime target format. OptiQ uses a Q2/group-128
+                // base with Q8/group-64 embeddings and shared experts.
+                guard [2, 3, 4, 6, 8].contains(bits),
+                      [32, 64, 128].contains(g) else {
                     throw RepackError.configJsonInvalid(
                         path: configPath,
-                        detail: "quantization override \(k) group_size \(g) != base \(baseGroup)")
+                        detail: "unsupported quantization override \(k): \(bits)-bit group_size \(g)")
                 }
                 overrides[k] = QuantSpec(bits: bits, groupSize: g)
             }

@@ -35,6 +35,12 @@ public struct Model {
     public var sourceSnapshotHash: String? { manifest.sourceSnapshotHash }
     public var sharedExpertWeightBits: Int { manifest.quant?.sharedExpert.weightBits ?? 8 }
     public var routedExpertWeightBits: Int { manifest.quant?.routedExpert.weightBits ?? 4 }
+    public var embeddingWeightBits: Int { manifest.quant?.embedding.weightBits ?? 4 }
+    public var attentionWeightBits: Int { manifest.quant?.attention.weightBits ?? 4 }
+    public var embeddingGroupSize: Int { manifest.quant?.embedding.groupSize ?? 64 }
+    public var attentionGroupSize: Int { manifest.quant?.attention.groupSize ?? 64 }
+    public var sharedExpertGroupSize: Int { manifest.quant?.sharedExpert.groupSize ?? 64 }
+    public var routedExpertGroupSize: Int { manifest.quant?.routedExpert.groupSize ?? 64 }
 
     let residentBuffer: ResidentBuffer
     let residentIndex: ResidentIndex

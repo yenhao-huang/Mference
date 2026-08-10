@@ -156,6 +156,10 @@ struct DeepseekV4RepackPlannerTests {
         #expect(SourceFingerprint.modelID(forIndexSha256:
             "d1c2d929ab0a35be32cf18026bb31d6f99dad58d6c93a5a2abbe43791f9d6c30")
             == "deepseek-v4-flash-2bit-dq")
+        #expect(SourceFingerprint.knownFingerprints["deepseek-v4-flash-0731-optiq-2bit"]
+            == "02bb76b0f49370b0b4b469462f5069335f0b5c06a759e2088f87e03ce5a61331")
+        #expect(SupportedModelSource.named("deepseekv4flash0731optiq")
+            == .deepseekV4Flash0731OptiQ)
         // Pinned repos never resolve through the trust-on-first-use path.
         #expect(SourceFingerprint.trustOnFirstUseModelID(
             forRepoID: "mlx-community/DeepSeek-V4-Flash-2bit-DQ") == nil)
@@ -187,6 +191,9 @@ struct DeepseekV4RepackPlannerTests {
             "model.hc_head.fn", numLayers: 4, family: f) == .lmResident)
         #expect(RepackPlanner.classify(
             "lm_head.weight", numLayers: 4, family: f) == .lmResident)
+        #expect(RepackPlanner.classify(
+            "mtp.0.ffn.switch_mlp.gate_proj.weight",
+            numLayers: 4, family: f) == .excludedMultimodal)
         // The Gemma/Qwen prefix is not this family's contract.
         #expect(RepackPlanner.classify(
             "language_model.model.layers.0.ffn.switch_mlp.gate_proj.weight",

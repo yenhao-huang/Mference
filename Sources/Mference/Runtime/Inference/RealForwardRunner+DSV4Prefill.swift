@@ -57,9 +57,11 @@ struct DSV4PrefillBindings {
     let dsv4: DSV4Kernels
     let moeDSV4: MoEDeepseekV4
     let state: DSV4StateManager
-    let int4: DequantInt4GEMV
+    let int4: AffineGEMV
+    let headGEMV: AffineGEMV
+    let sharedGEMV: AffineGEMV
     let rms: RMSNorm
-    let embed: EmbedLookupInt4
+    let embed: AffineEmbedLookup
     let fusionHead: LMHeadChainInt4
     let sharedExperts: [DSV4PrefillSharedExpert]
     let effectiveScales: [MTLBuffer]
@@ -608,7 +610,7 @@ final class DSV4ChunkedPrefill {
                               position: position, rope: ropeKind, direction: -1)
 
             b.dsv4.encodeOGroupProjection(
-                commandBuffer: cb,
+                commandBuffer: cb, affine: b.int4,
                 weights: oaView.buffer, weightsOffset: Int(oaView.offset),
                 scales: oaView.buffer, scalesOffset: Int(oaView.scaleOffset),
                 biases: oaView.buffer, biasesOffset: Int(oaView.biasOffset),
@@ -734,6 +736,7 @@ final class DSV4ChunkedPrefill {
 
         let routedOffsets = b.model.routedExpertOffsets(layer: L)
         let gateGroupSize = UInt32(b.model.routedGateGroupSize(layer: L))
+        let expertGroupSize = UInt32(b.model.routedExpertGroupSize)
         let liveTiles = tiles.filter { $0.routeCount > 0 }
 
         var pending: PendingRoutedTile?
@@ -772,10 +775,12 @@ final class DSV4ChunkedPrefill {
             let cb = try makeCommandBuffer()
             encodeRoutedPairs(cb, pso: phase1PSO, argBuffer: argBuf, blobs: blobs,
                               offsets: routedOffsets, gateGroupSize: gateGroupSize,
+                              expertGroupSize: expertGroupSize,
                               routeStart: tile.routeStart, routeCount: tile.routeCount,
                               rowsPerRoute: cfg.moeIntermediateSize, isPhase1: true)
             encodeRoutedPairs(cb, pso: downPSO, argBuffer: argBuf, blobs: blobs,
                               offsets: routedOffsets, gateGroupSize: gateGroupSize,
+                              expertGroupSize: expertGroupSize,
                               routeStart: tile.routeStart, routeCount: tile.routeCount,
                               rowsPerRoute: cfg.hiddenSize, isPhase1: false)
             cb.commit()
@@ -867,7 +872,7 @@ final class DSV4ChunkedPrefill {
             b.rms.encodeBF16W(commandBuffer: cb, x: hidden,
                               weight: fNorm.buffer, weightOffset: Int(fNorm.offset),
                               out: normed, d: D, eps: eps)
-            b.int4.encode(commandBuffer: cb,
+            b.headGEMV.encode(commandBuffer: cb,
                           weights: lm.buffer, weightsOffset: Int(lm.offset),
                           scales: lm.buffer, scalesOffset: Int(lm.scaleOffset),
                           biases: lm.buffer, biasesOffset: Int(lm.biasOffset),
@@ -901,12 +906,12 @@ final class DSV4ChunkedPrefill {
         let D = UInt32(cfg.hiddenSize)
         let F = UInt32(cfg.intermediateSize)
         let xOff = t * hiddenStride
-        b.int4.encode(commandBuffer: cb,
+        b.sharedGEMV.encode(commandBuffer: cb,
                       weights: proj.gate.weights, weightsOffset: proj.gate.weightsOffset,
                       scales: proj.gate.scales, scalesOffset: proj.gate.scalesOffset,
                       biases: proj.gate.biases, biasesOffset: proj.gate.biasesOffset,
                       x: routedX, xOffset: xOff, y: denseGate, m: F, n: D)
-        b.int4.encode(commandBuffer: cb,
+        b.sharedGEMV.encode(commandBuffer: cb,
                       weights: proj.up.weights, weightsOffset: proj.up.weightsOffset,
                       scales: proj.up.scales, scalesOffset: proj.up.scalesOffset,
                       biases: proj.up.biases, biasesOffset: proj.up.biasesOffset,
@@ -915,7 +920,7 @@ final class DSV4ChunkedPrefill {
                                     gate: denseGate, up: denseUp, out: denseAct,
                                     n: cfg.intermediateSize,
                                     limit: Float(cfg.swigluLimit))
-        b.int4.encode(commandBuffer: cb,
+        b.sharedGEMV.encode(commandBuffer: cb,
                       weights: proj.down.weights, weightsOffset: proj.down.weightsOffset,
                       scales: proj.down.scales, scalesOffset: proj.down.scalesOffset,
                       biases: proj.down.biases, biasesOffset: proj.down.biasesOffset,
@@ -931,6 +936,11 @@ final class DSV4ChunkedPrefill {
         let out = t * cfg.topKExperts
         if table.dtype == 4 {
             let tPtr = base.assumingMemoryBound(to: Int64.self)
+            for i in 0..<cfg.topKExperts {
+                idxPtr[out + i] = min(UInt32(clamping: max(0, tPtr[row + i])), expertCap)
+            }
+        } else if table.dtype == 5 {
+            let tPtr = base.assumingMemoryBound(to: Int32.self)
             for i in 0..<cfg.topKExperts {
                 idxPtr[out + i] = min(UInt32(clamping: max(0, tPtr[row + i])), expertCap)
             }
@@ -1014,6 +1024,7 @@ final class DSV4ChunkedPrefill {
                                    blobs: [MTLBuffer],
                                    offsets: MoEExpertOffsets,
                                    gateGroupSize: UInt32,
+                                   expertGroupSize: UInt32,
                                    routeStart: Int,
                                    routeCount: Int,
                                    rowsPerRoute: Int,
@@ -1029,6 +1040,7 @@ final class DSV4ChunkedPrefill {
         var topK = UInt32(b.cfg.topKExperts)
         var start = UInt32(routeStart)
         var count = UInt32(routeCount)
+        var expertGroup = expertGroupSize
         if isPhase1 {
             enc.setBuffer(routedX, offset: 0, index: 2)
             enc.setBuffer(acts, offset: 0, index: 3)
@@ -1037,6 +1049,10 @@ final class DSV4ChunkedPrefill {
             enc.setBytes(&topK, length: MemoryLayout<UInt32>.stride, index: 6)
             var gateGroup = gateGroupSize
             enc.setBytes(&gateGroup, length: MemoryLayout<UInt32>.stride, index: 7)
+            enc.setBytes(&expertGroup, length: MemoryLayout<UInt32>.stride, index: 8)
+            enc.setBuffer(routesBuffer, offset: 0, index: 9)
+            enc.setBytes(&start, length: MemoryLayout<UInt32>.stride, index: 10)
+            enc.setBytes(&count, length: MemoryLayout<UInt32>.stride, index: 11)
         } else {
             enc.setBuffer(acts, offset: 0, index: 2)
             enc.setBuffer(routeWeights, offset: 0, index: 3)
@@ -1044,10 +1060,11 @@ final class DSV4ChunkedPrefill {
             enc.setBytes(&d, length: MemoryLayout<UInt32>.stride, index: 5)
             enc.setBytes(&f, length: MemoryLayout<UInt32>.stride, index: 6)
             enc.setBytes(&topK, length: MemoryLayout<UInt32>.stride, index: 7)
+            enc.setBytes(&expertGroup, length: MemoryLayout<UInt32>.stride, index: 8)
+            enc.setBuffer(routesBuffer, offset: 0, index: 9)
+            enc.setBytes(&start, length: MemoryLayout<UInt32>.stride, index: 10)
+            enc.setBytes(&count, length: MemoryLayout<UInt32>.stride, index: 11)
         }
-        enc.setBuffer(routesBuffer, offset: 0, index: 8)
-        enc.setBytes(&start, length: MemoryLayout<UInt32>.stride, index: 9)
-        enc.setBytes(&count, length: MemoryLayout<UInt32>.stride, index: 10)
         let rows = routeCount * rowsPerRoute
         enc.dispatchThreadgroups(
             MTLSize(width: (rows + 7) / 8, height: 1, depth: 1),

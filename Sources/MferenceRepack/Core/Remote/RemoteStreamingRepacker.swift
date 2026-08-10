@@ -581,12 +581,14 @@ public final class RemoteStreamingRepacker {
             router: 8,
             sharedExpert: 8,
             routedExpert: 4)
+        var groups = GTurboJSON.QuantGroupSizes.runtimeDefault
         for e in plan.resident.entries {
             if e.name == "language_model.model.embed_tokens.weight"
                 || e.name == "model.embed_tokens.weight"
                 || e.name == "model.llm.embed.weight",
                let s = e.quantSpec {
                 bits.embedding = s.bits
+                groups.embedding = s.groupSize
             }
             if e.name.hasSuffix(".self_attn.q_proj.weight")
                 || e.name.hasSuffix(".attn.wq_a.weight")
@@ -594,18 +596,21 @@ public final class RemoteStreamingRepacker {
                 || e.name.hasSuffix(".linear_attn.in_proj_qkv.weight"),
                let s = e.quantSpec {
                 bits.attention = s.bits
+                groups.attention = s.groupSize
             }
             if e.name.hasSuffix(".router.proj.weight")
                 || e.name.hasSuffix(".mlp.gate.weight")
                 || e.name.hasSuffix(".ffn.gate.weight"),
                let s = e.quantSpec {
                 bits.router = s.bits
+                groups.router = s.groupSize
             }
             if e.name.hasSuffix(".mlp.shared_expert.gate_proj.weight")
                 || e.name.hasSuffix(".mlp.shared_experts.gate_proj.weight")
                 || e.name.hasSuffix(".ffn.shared_experts.gate_proj.weight"),
                let s = e.quantSpec {
                 bits.sharedExpert = s.bits
+                groups.sharedExpert = s.groupSize
             }
             // Gemma folds the shared expert into the bare `.mlp.` names.
             // Inkling uses those same names for its two dense-FFN layers, so
@@ -615,11 +620,13 @@ public final class RemoteStreamingRepacker {
                e.name.hasSuffix(".mlp.gate_proj.weight"),
                let s = e.quantSpec {
                 bits.sharedExpert = s.bits
+                groups.sharedExpert = s.groupSize
             }
         }
         if let layer = plan.layers.first(where: { !$0.subTensors.isEmpty }),
            let routedBits = layer.subTensors.first?.bitsForWeights {
             bits.routedExpert = routedBits
+            groups.routedExpert = layer.subTensors.first?.groupSizeForWeights ?? groups.routedExpert
         }
         let files = audit.outputFiles.map {
             ($0.relativePath, GTurboJSON.FileEntry(size: $0.size, sha256: $0.sha256))
@@ -638,7 +645,8 @@ public final class RemoteStreamingRepacker {
             expertsPerLayer: plan.layers.first(where: { $0.expertsPerLayer > 0 })?.expertsPerLayer ?? 0,
             numLayers: plan.arch.numLayers,
             expertStride: expertStride,
-            bitWidths: bits)
+            bitWidths: bits,
+            groupSizes: groups)
         let tmp = (partialDir as NSString).appendingPathComponent("manifest.json.tmp")
         let final = (partialDir as NSString).appendingPathComponent("manifest.json")
         try writeSmall(path: tmp, data: data)

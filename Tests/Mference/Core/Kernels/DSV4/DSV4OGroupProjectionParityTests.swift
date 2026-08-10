@@ -26,6 +26,8 @@ import MferenceValidationSupport
         let kernels = try DSV4Kernels(context: ctx, config: cfg)
         let int4 = try DequantInt4GEMV(context: ctx,
                                        additionalShapes: cfg.decodeInt4GEMVShapes)
+        let affine = try AffineGEMV(context: ctx, weightBits: 4, groupSize: 64,
+                                    additionalShapes: cfg.decodeInt4GEMVShapes)
         let device = ctx.device
         var rng = SplitMix64(seed: 0x0A_5017_2026_0802)
 
@@ -70,7 +72,7 @@ import MferenceValidationSupport
 
         let cb = try #require(ctx.queue.makeCommandBuffer())
         kernels.encodeOGroupProjection(
-            commandBuffer: cb,
+            commandBuffer: cb, affine: affine,
             weights: weights, weightsOffset: 0,
             scales: scales, scalesOffset: 0,
             biases: biases, biasesOffset: 0,

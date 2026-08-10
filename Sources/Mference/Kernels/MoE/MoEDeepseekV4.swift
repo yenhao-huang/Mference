@@ -196,12 +196,14 @@ final class MoEDeepseekV4 {
                             acts: MTLBuffer,
                             d: UInt32,
                             f: UInt32,
-                            gateGroupSize: UInt32) {
+                            gateGroupSize: UInt32,
+                            expertGroupSize: UInt32) {
         validate(routedBlobs: routedBlobs)
         var dimension = d
         var intermediate = f
         var expertCount = UInt32(Self.topK)
         var gateGroup = gateGroupSize
+        var expertGroup = expertGroupSize
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.setComputePipelineState(phase1Int2PSO)
         encoder.setBuffer(routedArgBuffer, offset: 0, index: 0)
@@ -214,6 +216,7 @@ final class MoEDeepseekV4 {
         encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride, index: 5)
         encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 6)
         encoder.setBytes(&gateGroup, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.setBytes(&expertGroup, length: MemoryLayout<UInt32>.stride, index: 8)
         encoder.dispatchThreadgroups(
             MTLSize(width: (Self.topK * Int(f) + 7) / 8, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
@@ -231,7 +234,8 @@ final class MoEDeepseekV4 {
                                   activeCount: UInt32,
                                   d: UInt32,
                                   f: UInt32,
-                                  gateGroupSize: UInt32) {
+                                  gateGroupSize: UInt32,
+                                  expertGroupSize: UInt32) {
         guard activeCount > 0 else { return }
         validate(routedBlobs: routedBlobs)
         precondition(activeSlotIndices.count == Int(activeCount))
@@ -240,6 +244,7 @@ final class MoEDeepseekV4 {
         var expertCount = UInt32(Self.topK)
         var active = activeCount
         var gateGroup = gateGroupSize
+        var expertGroup = expertGroupSize
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.setComputePipelineState(phase1SubsetInt2PSO)
         encoder.setBuffer(routedArgBuffer, offset: 0, index: 0)
@@ -256,6 +261,7 @@ final class MoEDeepseekV4 {
         encoder.setBuffer(activeSlots, offset: 0, index: 7)
         encoder.setBytes(&active, length: MemoryLayout<UInt32>.stride, index: 8)
         encoder.setBytes(&gateGroup, length: MemoryLayout<UInt32>.stride, index: 9)
+        encoder.setBytes(&expertGroup, length: MemoryLayout<UInt32>.stride, index: 10)
         encoder.dispatchThreadgroups(
             MTLSize(width: (Int(activeCount) * Int(f) + 7) / 8, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
@@ -271,10 +277,12 @@ final class MoEDeepseekV4 {
                                   residual: MTLBuffer,
                                   y: MTLBuffer,
                                   d: UInt32,
-                                  f: UInt32) {
+                                  f: UInt32,
+                                  expertGroupSize: UInt32) {
         validate(routedBlobs: routedBlobs)
         var dimension = d
         var intermediate = f
+        var expertGroup = expertGroupSize
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.setComputePipelineState(phase2ReduceInt2K6PSO)
         encoder.setBuffer(routedArgBuffer, offset: 0, index: 0)
@@ -287,6 +295,7 @@ final class MoEDeepseekV4 {
         encoder.setBuffer(y, offset: 0, index: 5)
         encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 6)
         encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.setBytes(&expertGroup, length: MemoryLayout<UInt32>.stride, index: 8)
         // Six simdgroups: one per streamed expert.
         encoder.dispatchThreadgroups(
             MTLSize(width: Int(d), height: 1, depth: 1),

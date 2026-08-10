@@ -22,6 +22,18 @@ enum GTurboJSON {
         var routedExpert: Int
     }
 
+    struct QuantGroupSizes {
+        var embedding: Int
+        var attention: Int
+        var router: Int
+        var sharedExpert: Int
+        var routedExpert: Int
+
+        static let runtimeDefault = QuantGroupSizes(
+            embedding: 64, attention: 64, router: 64,
+            sharedExpert: 64, routedExpert: 64)
+    }
+
     static func encodeManifest(plan: RepackPlan,
                                       modelID: String,
                                       sourceSnapshotHash: String,
@@ -29,7 +41,8 @@ enum GTurboJSON {
                                       expertsPerLayer: Int,
                                       numLayers: Int,
                                       expertStride: UInt64,
-                                      bitWidths: QuantBitWidths) throws -> Data {
+                                      bitWidths: QuantBitWidths,
+                                      groupSizes: QuantGroupSizes = .runtimeDefault) throws -> Data {
         let arch = plan.arch
         var archDict: [String: Any] = [
             "hiddenSize": arch.hiddenSize,
@@ -129,6 +142,13 @@ enum GTurboJSON {
             "sharedExpert": bitWidths.sharedExpert,
             "routedExpert": bitWidths.routedExpert,
         ]
+        let quantGroups = [
+            "embedding": groupSizes.embedding,
+            "attention": groupSizes.attention,
+            "router": groupSizes.router,
+            "sharedExpert": groupSizes.sharedExpert,
+            "routedExpert": groupSizes.routedExpert,
+        ]
         var quantDict: [String: Any] = [:]
         for (slot, bits) in quantBits {
             quantDict[slot] = [
@@ -136,7 +156,7 @@ enum GTurboJSON {
                 "scheme": plan.baseMode,
                 "scaleType": "BF16",
                 "biasType": "BF16",
-                "groupSize": plan.baseGroupSize
+                "groupSize": quantGroups[slot] ?? plan.baseGroupSize
             ]
         }
 

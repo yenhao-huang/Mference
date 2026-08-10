@@ -54,6 +54,7 @@ struct PerExpertTensorSlice: Sendable {
     let sourceOffsetPerExpert: UInt64  // stride per expert in source
     let sourceTensor: SourceTensor
     let bitsForWeights: Int?           // 4 for routed expert weight; nil for scales/biases
+    let groupSizeForWeights: Int?      // quant group for weights; nil for scales/biases
 }
 
 struct LayerFilePlan: Sendable {
@@ -106,6 +107,12 @@ enum RepackPlanner {
 
     static func classify(_ name: String, numLayers: Int,
                          family: RepackModelFamily) -> Bucket {
+        // DeepSeek 0731 bundles speculative MTP heads beside the ordinary
+        // decoder. They are not required for autoregressive inference and do
+        // not belong in the resident core or routed-expert stream.
+        if family == .deepseekV4Flash, name.hasPrefix("mtp.") {
+            return .excludedMultimodal
+        }
         if hasResidentPrefix(name, family: family) {
             // Routed expert?
             if let role = routedExpertRole(in: name, family: family),
@@ -189,7 +196,8 @@ enum RepackPlanner {
         var excludedMultimodalNames: [String] = []
         var routedByLayerAndRole: [Int: [String: String]] = [:]
         for (name, _) in registry {
-            if isMultimodalTensorName(name) {
+            if isMultimodalTensorName(name) ||
+                (arch.family == .deepseekV4Flash && name.hasPrefix("mtp.")) {
                 excludedMultimodalNames.append(name)
             }
             if name.hasSuffix(".scales") || name.hasSuffix(".biases") { continue }
@@ -423,21 +431,21 @@ enum RepackPlanner {
                 logicalShape: logicalPerExpert,
                 offsetInExpertBlob: blobCursor, sizeInExpertBlob: perExpertWeightSize,
                 sourceOffsetPerExpert: perExpertWeightSize, sourceTensor: w,
-                bitsForWeights: spec.bits)
+                bitsForWeights: spec.bits, groupSizeForWeights: spec.groupSize)
             blobCursor += perExpertWeightSize
             let sSlice = PerExpertTensorSlice(
                 role: role, component: "scales", dtype: 1,
                 logicalShape: scalesLogical,
                 offsetInExpertBlob: blobCursor, sizeInExpertBlob: perExpertScaleSize,
                 sourceOffsetPerExpert: perExpertScaleSize, sourceTensor: s,
-                bitsForWeights: nil)
+                bitsForWeights: nil, groupSizeForWeights: nil)
             blobCursor += perExpertScaleSize
             let bSlice = PerExpertTensorSlice(
                 role: role, component: "biases", dtype: 1,
                 logicalShape: biasesLogical,
                 offsetInExpertBlob: blobCursor, sizeInExpertBlob: perExpertBiasSize,
                 sourceOffsetPerExpert: perExpertBiasSize, sourceTensor: b,
-                bitsForWeights: nil)
+                bitsForWeights: nil, groupSizeForWeights: nil)
             blobCursor += perExpertBiasSize
 
             subs.append(wSlice); subs.append(sSlice); subs.append(bSlice)
@@ -453,7 +461,10 @@ enum RepackPlanner {
     // MARK: - Helpers
 
     private static func ietnyDtype(_ d: SourceTensor.Dtype) -> UInt8 {
-        switch d { case .u32: 0; case .bf16: 1; case .fp16: 2; case .fp32: 3; case .i64: 4 }
+        switch d {
+        case .u32: 0; case .bf16: 1; case .fp16: 2; case .fp32: 3
+        case .i64: 4; case .i32: 5
+        }
     }
 
     private static func roundUpToPage(_ v: UInt64) -> UInt64 {
@@ -471,10 +482,12 @@ enum RepackPlanner {
 
     /// Logical shape of a packed quantized tensor whose source is `[D0,..,Dn-1, Dn/factor]`.
     private static func logicalShape(forPackedSource source: [UInt64], bits: Int) -> [UInt64] {
-        let factor = UInt64(32 / bits)
         guard !source.isEmpty else { return source }
         var out = source
-        out[out.count - 1] = source[source.count - 1] * factor
+        let packedBits = source[source.count - 1] * 32
+        precondition(packedBits.isMultiple(of: UInt64(bits)),
+                     "packed row is not divisible by \(bits) bits")
+        out[out.count - 1] = packedBits / UInt64(bits)
         return out
     }
 
